@@ -4,9 +4,10 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from . import db as dbmod
+from . import corrections, db as dbmod
+from .config import settings
 from .manager import SlotBusyError, manager
-from .models import CreateJobRequest, JobOut
+from .models import CreateJobRequest, JobOut, TimeCorrectionRequest, TimeCorrectionResponse
 from .sqlvalidation import SqlValidationError
 
 app = FastAPI(
@@ -15,8 +16,10 @@ app = FastAPI(
         "提交两条只读 SELECT，基于同一已提交快照并行读取，"
         "按行内容与出现次数做有序多重集核对（忽略行序，NULL≠空串），"
         "差异最多展示 20 种。单轮 30 秒，全局同时只允许一个任务。"
+        "另提供读数时刻批量校正接口，只移动 read_time、不改累计 Wh，"
+        "冲突时整次回滚。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -64,6 +67,47 @@ def cancel_job(job_id: str) -> JobOut:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="任务不存在") from exc
     return job.snapshot()
+
+
+@app.post(
+    "/time-corrections",
+    response_model=TimeCorrectionResponse,
+    status_code=200,
+    tags=["时刻校正"],
+)
+def create_time_correction(payload: TimeCorrectionRequest) -> TimeCorrectionResponse:
+    """批量校正读数时刻：只改 read_time，不改累计 Wh。
+
+    - 窗口为 UTC 左闭右开 `[start_utc, end_utc)`，仅处理指定表号；
+    - 偏移非零、绝对值不超过 120 分钟，单次最多 500 条；
+    - 目标时刻可与本批其他记录搬走的位置重合，允许跨日；
+    - 与未移动读数冲突，或并发校正 / 直连 SQL 写入撞键时，整次回滚。
+    """
+    try:
+        payload.validate_window()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        result = corrections.apply_time_correction(
+            meter_id=payload.meter_id,
+            start_utc=payload.start_utc,
+            end_utc=payload.end_utc,
+            offset_minutes=payload.offset_minutes,
+            max_rows=settings.correction_max_rows,
+        )
+    except corrections.CorrectionConflict as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc)}) from exc
+    except corrections.CorrectionError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)}) from exc
+
+    return TimeCorrectionResponse(
+        moved_count=result.moved_count,
+        meter_id=result.meter_id,
+        start_utc=result.start_utc,
+        end_utc=result.end_utc,
+        offset_minutes=result.offset_minutes,
+    )
 
 
 @app.exception_handler(dbmod.DbError)

@@ -5,6 +5,10 @@
 **行内容 + 出现次数**做多重集核对（忽略行序，`NULL` 与空串视为不同），
 返回一致结论或最多 20 种差异行及两侧次数。
 
+另外提供**读数时刻批量校正 API**：电表采集时钟出现偏差时，按表号和
+UTC 左闭右开时间段把已入仓读数的 `read_time` 整体平移指定分钟数，
+只改时刻、不改累计 Wh；与未移动读数或并发写入冲突时整次回滚。
+
 ## 1. 快速启动
 
 ```bash
@@ -31,6 +35,7 @@ docker compose down -v
 | `GET`  | `/jobs` | 列出近期任务（含终态），状态查询始终可用 |
 | `GET`  | `/jobs/{job_id}` | 查询单个任务状态与结论 |
 | `POST` | `/jobs/{job_id}/cancel` | 请求取消，及时受理 |
+| `POST` | `/time-corrections` | 读数时刻批量校正（只改 `read_time`，不改 Wh；冲突整体回滚） |
 
 任务状态：`pending → running →（cancelling）→ succeeded | failed | cancelled | timeout`。
 失败、取消、超时一律 **不发布比较结论**（`result` 为 `null`），仅给出原因。
@@ -66,7 +71,59 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 }
 ```
 
-## 3. 对提交 SQL 的约束
+## 3. 时刻校正 API（`POST /time-corrections`）
+
+电表采集时钟出现偏差后，在日结前把已入仓读数的时刻整体校正。
+
+### 请求与响应
+
+```bash
+curl -X POST http://localhost:8000/time-corrections \
+  -H 'Content-Type: application/json' -d '{
+    "meter_id": 1001,
+    "start_utc": "2026-11-15T08:00:00Z",
+    "end_utc":   "2026-11-15T10:00:00Z",
+    "offset_minutes": 30
+  }'
+# 200
+# {"moved_count": 2, "meter_id": 1001,
+#  "start_utc": "2026-11-15T08:00:00Z", "end_utc": "2026-11-15T10:00:00Z",
+#  "offset_minutes": 30}
+```
+
+约束与语义：
+
+- `meter_id`：表号；`start_utc` / `end_utc` 为 **UTC 左闭右开**
+  `[start_utc, end_utc)`，时刻必须带时区（服务统一按 UTC 处理），
+  且起点早于终点；
+- `offset_minutes`：分钟偏移，**非零且绝对值不超过 120**，正数向后、
+  负数向前，允许跨日；
+- 单次最多处理 **500 条**，超出返回 `422` 且不做任何修改；窗口内
+  没有命中任何读数时返回 `moved_count=0`；
+- 以本次选中的源记录为整体，**只改 `read_time`、不改累计 `wh`**；
+- 目标时刻可以是**本批其他记录搬走后腾出的位置**（整批平移、链式移动
+  都合法），也可以跨日；
+- 目标时刻与**未移动读数**冲突，或与**并发校正 / 直连 SQL 写入**撞
+  `(meter_id, read_time)` 主键时，返回 `409` 且**整次校正回滚**：
+  不覆盖其他读数，也不丢失其他会话已提交的 Wh 更正；
+- 校正成功后，原有 `POST /jobs` 的只读 SQL 立即读到新时刻；校正失败
+  后仍是原记录。
+
+### 事务与并发保证
+
+整次校正运行在**单个事务**内（见 `app/corrections.py`）：
+
+1. `SELECT ... FOR UPDATE` 锁定窗口内该表号的全部选中行，确保
+   DELETE+INSERT 基于最新已提交状态，并发的 Wh 更正会在本事务提交后生效、
+   不会被旧值覆盖；
+2. 对只属于“非选中行”的目标时刻做 `SELECT ... FOR UPDATE` 冲突探测，
+   同批目标位置（含本批搬走腾出的位置）放行；
+3. `DELETE` 旧时刻 + `INSERT` 新时刻，**不使用 `ON CONFLICT`**：任何漏网
+   的并发撞键都会以唯一约束冲突的形式抛出并回滚，绝不静默覆盖；
+4. 连接设置 `lock_timeout`，等锁快速失败；`UniqueViolation` /
+   `LockNotAvailable` / `SerializationFailure` 统一映射为 `409` 回滚。
+
+## 4. 对提交 SQL 的约束
 
 - 必须是**单条只读 SELECT**（允许 `WITH` / `UNION` / `INTERSECT` / `EXCEPT`），
   静态解析拒绝多语句与任何写操作 / DDL / `SELECT INTO` / `LOCK` / `CALL` 等；
@@ -75,7 +132,7 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 - 数据库连接再叠加一层纵深防御：`READ ONLY` 事务、`statement_timeout`、
   `lock_timeout`，即使静态校验被绕过也无法写入或长时间持锁。
 
-## 4. 关键设计
+## 5. 关键设计
 
 ### 同一已提交快照，源表仍可更正
 
@@ -102,7 +159,7 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 - 严格按顺序收尾：**中止 SQL → 关闭连接 → 清空暂存目录 → 释放名额 → 才落终态**，
   因此状态查询一旦看到终态，名额必然已经释放、暂存必然已经清空。
 
-## 5. 配置（环境变量）
+## 6. 配置（环境变量）
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -112,8 +169,11 @@ curl -X POST http://localhost:8000/jobs -H 'Content-Type: application/json' -d '
 | `SORT_CHUNK_ROWS` | `20000` | 单个排序块行数 |
 | `MAX_DIFF_TYPES` | `20` | 差异展示上限 |
 | `WORK_DIR` | `/tmp/recon-work` | 外部排序暂存目录（独立卷） |
+| `CORRECTION_MAX_ROWS` | `500` | 单次时刻校正最多处理条数 |
+| `CORRECTION_MAX_OFFSET_MINUTES` | `120` | 分钟偏移允许的最大绝对值 |
+| `CORRECTION_LOCK_TIMEOUT_MS` | `3000` | 校正事务等行锁的超时（毫秒），超时即回滚 |
 
-## 6. 本地自测
+## 7. 本地自测
 
 ```bash
 # 单元 + 集成测试（集成测试需要一个 PostgreSQL；可用 PG_DSN 指定）
@@ -127,7 +187,7 @@ python scripts/load_test.py
 含一次重复计入差异，端到端约 16 秒，进程峰值 RSS 约 68 MiB，
 暂存峰值约 44 MiB，结束后暂存目录清空、名额释放。
 
-## 7. 目录结构
+## 8. 目录结构
 
 ```
 app/
@@ -136,11 +196,12 @@ app/
   db.py              快照会话、只读连接、命名游标流式拉取、列类型闸门
   external_merge.py  流式 run、k 路归并、多重集核对
   manager.py         单名额编排、看门狗、取消/超时/失败的统一收尾
+  corrections.py     读数时刻批量校正（单事务、行锁、冲突整体回滚）
   models.py          API 模型
   main.py            FastAPI 路由
 sql/init.sql         源表、示例数据、示例查询
 scripts/             压测数据生成与负载脚本
-tests/               单元与集成测试
+tests/               单元与集成测试（含时刻校正并发/回滚用例）
 docker-compose.yml   应用（128MiB 上限）+ PostgreSQL
 Dockerfile
 ```

@@ -27,7 +27,14 @@ class Settings:
     connect_timeout: int = _env_int("PG_CONNECT_TIMEOUT", 5)
     statement_timeout_ms: int = _env_int("PG_STATEMENT_TIMEOUT_MS", 28000)
     lock_timeout_ms: int = _env_int("PG_LOCK_TIMEOUT_MS", 2000)
+    # 时刻校正为短事务，等锁应快速失败并回滚，避免并发校正互相长等
+    correction_lock_timeout_ms: int = _env_int("CORRECTION_LOCK_TIMEOUT_MS", 3000)
     idle_in_tx_timeout_ms: int = _env_int("PG_IDLE_IN_TX_TIMEOUT_MS", 60000)
+
+    # 单次时刻校正最多处理的读数条数
+    correction_max_rows: int = _env_int("CORRECTION_MAX_ROWS", 500)
+    # 分钟偏移允许的最大绝对值
+    correction_max_offset_minutes: int = _env_int("CORRECTION_MAX_OFFSET_MINUTES", 120)
 
     # 每轮核对的硬性时限（秒）
     job_timeout_seconds: int = _env_int("JOB_TIMEOUT_SECONDS", 30)
